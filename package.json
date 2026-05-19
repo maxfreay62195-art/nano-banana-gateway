@@ -1,0 +1,15 @@
+{
+  "name": "gemini-cloud-gateway",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy that translates /v1/images/generations into Google Gemini (Nano Banana 2) generateContent calls.",
+  "main": "gemini_gateway.js",
+  "scripts": {
+    "start": "node gemini_gateway.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
