@@ -122,7 +122,7 @@ async function discoverModel() {
 async function callGeminiOnce(model, prompt) {
   const payload = JSON.stringify({
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { responseModalities: ['IMAGE'] },
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
   });
   const { status, body } = await httpsRequest({
     hostname: GEMINI_HOST,
