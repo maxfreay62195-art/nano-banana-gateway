@@ -39,6 +39,7 @@ const IMAGE_MODEL_CHAIN = [
 
 const VIDEO_MODEL_CHAIN = [
   PREFERRED_VIDEO_MODEL,
+  'veo-3.1-generate-preview',
   'veo-3.0-generate-preview',
   'veo-3.0-fast-generate-preview',
   'veo-3-generate-preview',
@@ -155,7 +156,7 @@ async function startVeoOperation(model, prompt, opts = {}) {
     instances: [{ prompt }],
     parameters: {
       aspectRatio: opts.aspectRatio || '16:9',
-      durationSeconds: opts.durationSeconds || 5,
+      durationSeconds: opts.durationSeconds || 8,
       personGeneration: opts.personGeneration || 'allow_all',
     },
   });
@@ -212,6 +213,33 @@ function extractVideoUri(veoResponse) {
   if (pred?.videoUri) return pred.videoUri;
   if (pred?.bytesBase64Encoded) return `data:video/mp4;base64,${pred.bytesBase64Encoded}`;
   return null;
+}
+
+/* ---------- Download bytes (follows redirects) ---------- */
+
+function downloadBytes(urlStr, depth) {
+  depth = depth || 0;
+  return new Promise((resolve, reject) => {
+    if (depth > 6) return reject(new Error('too many redirects'));
+    const r = https.get(urlStr, { timeout: 120000 }, (up) => {
+      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
+        up.resume();
+        let next;
+        try { next = new URL(up.headers.location, urlStr).toString(); }
+        catch (e) { return reject(new Error('bad redirect target')); }
+        return resolve(downloadBytes(next, depth + 1));
+      }
+      if (up.statusCode < 200 || up.statusCode >= 300) {
+        up.resume();
+        return reject(new Error('download upstream ' + up.statusCode));
+      }
+      const chunks = [];
+      up.on('data', (c) => chunks.push(c));
+      up.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType: up.headers['content-type'] || 'video/mp4' }));
+    });
+    r.on('error', reject);
+    r.on('timeout', () => r.destroy(new Error('download timeout')));
+  });
 }
 
 /* ---------- Routes ---------- */
@@ -282,11 +310,27 @@ app.post('/v1/videos/generations', async (req, res) => {
     } else if (videoUri.startsWith('data:')) {
       downloadUrl = videoUri;
     }
+    // Capture the actual MP4 bytes now, while Google's URL is still alive,
+    // so the caller never loses the file to URL expiration.
+    let b64Mp4 = null;
+    let mp4Bytes = 0;
+    try {
+      if (videoUri.startsWith('https://' + GEMINI_HOST)) {
+        const dl = await downloadBytes(videoUri.includes('key=') ? videoUri : videoUri + (videoUri.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(GEMINI_API_KEY), 0);
+        b64Mp4 = dl.buffer.toString('base64');
+        mp4Bytes = dl.buffer.length;
+      } else if (videoUri.startsWith('data:')) {
+        b64Mp4 = videoUri.split(',')[1] || null;
+      }
+    } catch (e) {
+      console.warn('Video byte capture failed (returning URL only):', e.message);
+    }
     res.json({
       created: Math.floor(Date.now() / 1000),
       model: ACTIVE_VIDEO_MODEL,
       duration_s: elapsed,
-      data: [{ video_uri: videoUri, download_url: downloadUrl, revised_prompt: prompt }],
+      mp4_bytes: mp4Bytes,
+      data: [{ video_uri: videoUri, download_url: downloadUrl, b64_mp4: b64Mp4, revised_prompt: prompt }],
     });
   } catch (err) {
     console.error('Video gateway error:', err.message);
@@ -295,9 +339,9 @@ app.post('/v1/videos/generations', async (req, res) => {
 });
 
 /* GET /v1/videos/download?uri=<google file uri>
- * Streams the MP4 back with the API key attached. The caller never sees
- * the key. Restricted to generativelanguage.googleapis.com URIs only so
- * this can't be abused as an open proxy. */
+ * Streams the MP4 back with the API key attached, FOLLOWING any redirects
+ * (Google's file endpoint 302-redirects to a signed storage URL). The caller
+ * never sees the key. Restricted to generativelanguage.googleapis.com URIs. */
 app.get('/v1/videos/download', (req, res) => {
   const uri = req.query.uri;
   if (!uri || typeof uri !== 'string') {
@@ -311,17 +355,33 @@ app.get('/v1/videos/download', (req, res) => {
     return res.status(403).json({ error: { message: `Only https://${GEMINI_HOST} URIs may be proxied.`, type: 'forbidden' } });
   }
   u.searchParams.set('key', GEMINI_API_KEY);
-  const upstream = https.get(u.toString(), { timeout: 120000 }, (up) => {
-    res.status(up.statusCode || 502);
-    if (up.headers['content-type']) res.set('Content-Type', up.headers['content-type']);
-    if (up.headers['content-length']) res.set('Content-Length', up.headers['content-length']);
-    res.set('Content-Disposition', 'attachment; filename="video.mp4"');
-    up.pipe(res);
-  });
-  upstream.on('error', (e) => {
-    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'gateway_error' } });
-  });
-  upstream.on('timeout', () => upstream.destroy(new Error('download timeout')));
+  const fetchFollow = (urlStr, depth) => {
+    if (depth > 6) {
+      if (!res.headersSent) res.status(502).json({ error: { message: 'too many redirects', type: 'gateway_error' } });
+      return;
+    }
+    const r = https.get(urlStr, { timeout: 120000 }, (up) => {
+      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
+        up.resume();
+        let next;
+        try { next = new URL(up.headers.location, urlStr).toString(); } catch (e) {
+          if (!res.headersSent) res.status(502).json({ error: { message: 'bad redirect target', type: 'gateway_error' } });
+          return;
+        }
+        return fetchFollow(next, depth + 1);
+      }
+      res.status(up.statusCode || 502);
+      if (up.headers['content-type']) res.set('Content-Type', up.headers['content-type']);
+      if (up.headers['content-length']) res.set('Content-Length', up.headers['content-length']);
+      res.set('Content-Disposition', 'attachment; filename="video.mp4"');
+      up.pipe(res);
+    });
+    r.on('error', (e) => {
+      if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'gateway_error' } });
+    });
+    r.on('timeout', () => r.destroy(new Error('download timeout')));
+  };
+  fetchFollow(u.toString(), 0);
 });
 
 /* ---------- Self-ping keep-warm ---------- */
