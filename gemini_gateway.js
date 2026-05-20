@@ -3,10 +3,12 @@
  *
  * Unified gateway for Google's highest-quality visual generation:
  *   POST /v1/images/generations   -> Nano Banana 2 (gemini-3.1-flash-image-preview)
- *   POST /v1/videos/generations   -> Veo 3 (veo-3.0-generate-preview, long-running)
+ *   POST /v1/videos/generations   -> Veo (veo-3 preferred, auto-falls back, long-running)
+ *   GET  /v1/videos/download      -> auth-proxy that streams a Veo MP4 with the key attached
  *
- * Both endpoints accept { "prompt": "..." }. Images return base64 PNG.
- * Videos return a Google-hosted MP4 URI (gateway polls the LRO internally).
+ * Image responses return base64 PNG. Video responses return both the raw
+ * Google file URI AND a key-free download_url pointing at this gateway's
+ * own /v1/videos/download proxy, so callers never need the API key.
  *
  * Env vars:
  *   GEMINI_API_KEY (required), GEMINI_MODEL (optional), VEO_MODEL (optional),
@@ -24,6 +26,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PREFERRED_IMAGE_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-image-preview';
 const PREFERRED_VIDEO_MODEL = process.env.VEO_MODEL || 'veo-3.0-generate-preview';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
+const PUBLIC_URL = (process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL || '').replace(/\/$/, '');
 
 const IMAGE_MODEL_CHAIN = [
   PREFERRED_IMAGE_MODEL,
@@ -145,7 +148,7 @@ function extractImageB64(response) {
   return null;
 }
 
-/* ---------- Video generation (Veo 3, long-running) ---------- */
+/* ---------- Video generation (Veo, long-running) ---------- */
 
 async function startVeoOperation(model, prompt, opts = {}) {
   const payload = JSON.stringify({
@@ -217,12 +220,13 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'gemini-cloud-gateway',
-    engines: { image: 'Nano Banana 2', video: 'Veo 3' },
+    engines: { image: 'Nano Banana 2', video: 'Veo' },
     active_image_model: ACTIVE_IMAGE_MODEL,
     active_video_model: ACTIVE_VIDEO_MODEL,
     endpoints: {
       image: 'POST /v1/images/generations',
       video: 'POST /v1/videos/generations',
+      video_download: 'GET /v1/videos/download?uri=...',
     },
     time: new Date().toISOString(),
   });
@@ -272,16 +276,52 @@ app.post('/v1/videos/generations', async (req, res) => {
       return res.status(502).json({ error: { message: 'Veo returned no video URI.', type: 'upstream_error', raw: veoResp } });
     }
     const elapsed = Math.round((Date.now() - t0) / 1000);
+    let downloadUrl = null;
+    if (PUBLIC_URL && videoUri.startsWith('https://' + GEMINI_HOST)) {
+      downloadUrl = `${PUBLIC_URL}/v1/videos/download?uri=${encodeURIComponent(videoUri)}`;
+    } else if (videoUri.startsWith('data:')) {
+      downloadUrl = videoUri;
+    }
     res.json({
       created: Math.floor(Date.now() / 1000),
       model: ACTIVE_VIDEO_MODEL,
       duration_s: elapsed,
-      data: [{ video_uri: videoUri, revised_prompt: prompt }],
+      data: [{ video_uri: videoUri, download_url: downloadUrl, revised_prompt: prompt }],
     });
   } catch (err) {
     console.error('Video gateway error:', err.message);
     res.status(500).json({ error: { message: err.message, type: 'gateway_error', model_attempted: ACTIVE_VIDEO_MODEL } });
   }
+});
+
+/* GET /v1/videos/download?uri=<google file uri>
+ * Streams the MP4 back with the API key attached. The caller never sees
+ * the key. Restricted to generativelanguage.googleapis.com URIs only so
+ * this can't be abused as an open proxy. */
+app.get('/v1/videos/download', (req, res) => {
+  const uri = req.query.uri;
+  if (!uri || typeof uri !== 'string') {
+    return res.status(400).json({ error: { message: 'Query param "uri" is required.', type: 'invalid_request_error' } });
+  }
+  let u;
+  try { u = new URL(uri); } catch (e) {
+    return res.status(400).json({ error: { message: 'Invalid uri.', type: 'invalid_request_error' } });
+  }
+  if (u.protocol !== 'https:' || u.hostname !== GEMINI_HOST) {
+    return res.status(403).json({ error: { message: `Only https://${GEMINI_HOST} URIs may be proxied.`, type: 'forbidden' } });
+  }
+  u.searchParams.set('key', GEMINI_API_KEY);
+  const upstream = https.get(u.toString(), { timeout: 120000 }, (up) => {
+    res.status(up.statusCode || 502);
+    if (up.headers['content-type']) res.set('Content-Type', up.headers['content-type']);
+    if (up.headers['content-length']) res.set('Content-Length', up.headers['content-length']);
+    res.set('Content-Disposition', 'attachment; filename="video.mp4"');
+    up.pipe(res);
+  });
+  upstream.on('error', (e) => {
+    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'gateway_error' } });
+  });
+  upstream.on('timeout', () => upstream.destroy(new Error('download timeout')));
 });
 
 /* ---------- Self-ping keep-warm ---------- */
@@ -328,7 +368,7 @@ function startSelfPing() {
     console.log(`gemini-cloud-gateway listening on :${PORT}`);
     console.log(`Active image model: ${ACTIVE_IMAGE_MODEL}`);
     console.log(`Active video model: ${ACTIVE_VIDEO_MODEL}`);
-    console.log('Endpoints: POST /v1/images/generations, POST /v1/videos/generations');
+    console.log('Endpoints: POST /v1/images/generations, POST /v1/videos/generations, GET /v1/videos/download');
     startSelfPing();
   });
 })();
