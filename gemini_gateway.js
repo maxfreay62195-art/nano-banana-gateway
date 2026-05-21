@@ -54,6 +54,16 @@ if (!GEMINI_API_KEY) {
   process.exit(1);
 }
 
+/* ---------- Crash guards ----------
+ * A stream error during a video download must never take down the dyno.
+ * These keep the process alive so one bad request can't 503 the service. */
+process.on('uncaughtException', (e) => {
+  console.error('uncaughtException (kept alive):', (e && e.stack) || e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('unhandledRejection (kept alive):', (e && e.stack) || e);
+});
+
 /* ---------- HTTPS helper ---------- */
 
 function httpsRequest({ hostname, path, method = 'GET', headers = {}, body = null, timeoutMs = 120000 }) {
@@ -236,6 +246,7 @@ function downloadBytes(urlStr, depth) {
       const chunks = [];
       up.on('data', (c) => chunks.push(c));
       up.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType: up.headers['content-type'] || 'video/mp4' }));
+      up.on('error', reject);
     });
     r.on('error', reject);
     r.on('timeout', () => r.destroy(new Error('download timeout')));
@@ -361,6 +372,11 @@ app.get('/v1/videos/download', (req, res) => {
       return;
     }
     const r = https.get(urlStr, { timeout: 120000 }, (up) => {
+      up.on('error', (e) => {
+        console.warn('download upstream stream error:', e.message);
+        if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'gateway_error' } });
+        else res.destroy();
+      });
       if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
         up.resume();
         let next;
@@ -380,6 +396,7 @@ app.get('/v1/videos/download', (req, res) => {
       if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'gateway_error' } });
     });
     r.on('timeout', () => r.destroy(new Error('download timeout')));
+    res.on('close', () => { try { r.destroy(); } catch (e) {} });
   };
   fetchFollow(u.toString(), 0);
 });
