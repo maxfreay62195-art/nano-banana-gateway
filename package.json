@@ -4,7 +4,8 @@
   "description": "OpenAI-compatible proxy that translates /v1/images/generations into Google Gemini (Nano Banana 2) generateContent calls.",
   "main": "gemini_gateway.js",
   "scripts": {
-    "start": "node gemini_gateway.js"
+    "start": "node gemini_gateway.js",
+    "test": "node --test gateway-auth.test.js"
   },
   "engines": {
     "node": ">=18.0.0"

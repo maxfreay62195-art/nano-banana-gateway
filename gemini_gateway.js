@@ -19,6 +19,7 @@ const express = require('express');
 const https = require('https');
 
 const app = express();
+app.use('/v1', require('./gateway-auth'));
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 10000;
@@ -437,7 +438,7 @@ function startSelfPing() {
 
 /* ---------- Boot ---------- */
 
-(async () => {
+if (require.main === module) (async () => {
   const available = await listAvailableModels();
   ACTIVE_IMAGE_MODEL = pickFromChain(IMAGE_MODEL_CHAIN, available, 'image');
   ACTIVE_VIDEO_MODEL = pickFromChain(VIDEO_MODEL_CHAIN, available, 'veo');
@@ -449,3 +450,5 @@ function startSelfPing() {
     startSelfPing();
   });
 })();
+
+module.exports = app;
